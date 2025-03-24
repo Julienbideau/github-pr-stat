@@ -80,15 +80,12 @@ To use this script, you need a GitHub personal access token:
 ### Usage Examples
 
 ```bash
-# Analyze PRs with the "bug" label in the doctolib/main-app repository
-./github_pr_stats.sh doctolib/main-app bug ghp_your_token_here
+# Analyze PRs with the "team" label in the doctolib/main-app repository
+./github_pr_stats.sh organisation/main-app bug ghp_your_token_here
 
 # Analyze PRs with the "feature" label and retrieve up to 20 pages
-./github_pr_stats.sh doctolib/main-app feature ghp_your_token_here 20
+./github_pr_stats.sh organisation/main-app feature ghp_your_token_here 20
 
-# Analyze PRs with the "PIKA" label
-./github_pr_stats.sh doctolib/content-moderation PIKA ghp_your_token_here
-```
 
 ## Features
 
