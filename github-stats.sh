@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # GitHub Pull Request Analysis Script with customizable label
-# Usage: ./github_pr_stats.sh <owner/repo> <label> <github_token> [max_pages]
+# Usage: ./github_pr_stats.sh <owner/repo> <label> <github_token> [max_pages] [disable_sampling]
 
 # Check for required parameters
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 <owner/repo> <label> <github_token> [max_pages]"
-    echo "Example: $0 organisation/your-repo YOURLABEL YOUR_GITHUB_TOKEN 10"
+    echo "Usage: $0 <owner/repo> <label> <github_token> [max_pages] [disable_sampling]"
+    echo "Example: $0 my-orga/main-app YOURLABEL YOUR_GITHUB_TOKEN 10 true"
     echo "Error: Label and GitHub token are required."
+    echo "Optional: max_pages (default: 10), disable_sampling (true/false, default: false)"
     exit 1
 fi
 
@@ -15,8 +16,14 @@ REPO=$1
 LABEL=$2
 TOKEN=$3
 MAX_PAGES=${4:-10}
+DISABLE_SAMPLING=${5:-false}
 
 echo "Analyzing PRs with label '$LABEL' for repository $REPO (max $MAX_PAGES pages)"
+if [ "$DISABLE_SAMPLING" = "true" ]; then
+    echo "Sampling disabled: all PRs will be analyzed for comments and reviews"
+else
+    echo "Sampling enabled: a representative sample will be used for comments and reviews"
+fi
 
 # Calculate date from 3 months ago in ISO 8601 format
 THREE_MONTHS_AGO=$(date -v-3m +%Y-%m-%dT%H:%M:%SZ)
@@ -25,16 +32,18 @@ echo "Retrieving PRs since: $THREE_MONTHS_AGO"
 # Create a temporary directory
 TEMP_DIR=$(mktemp -d)
 PR_FILE="${TEMP_DIR}/prs.json"
+ALL_PR_NUMBERS="${TEMP_DIR}/all_pr_numbers.txt"  # Store all PR numbers for sampling
 TOTAL_COUNT_FILE="${TEMP_DIR}/total_count.txt"
 CREATORS_FILE="${TEMP_DIR}/creators.txt"  # Specific file for creators
 STATES_FILE="${TEMP_DIR}/states.txt"      # Specific file for states
 MERGED_FILE="${TEMP_DIR}/merged.txt"      # Specific file for merged PRs
 COMMENTERS_FILE="${TEMP_DIR}/commenters.txt"
+REVIEWERS_BY_PR_FILE="${TEMP_DIR}/reviewers_by_pr.txt"  # For PR review coverage
 PR_TIMES_FILE="${TEMP_DIR}/pr_times.csv"
 
 # Initialize files
 echo "0" > "$TOTAL_COUNT_FILE"
-touch "$PR_FILE" "$CREATORS_FILE" "$STATES_FILE" "$MERGED_FILE" "$COMMENTERS_FILE"
+touch "$PR_FILE" "$ALL_PR_NUMBERS" "$CREATORS_FILE" "$STATES_FILE" "$MERGED_FILE" "$COMMENTERS_FILE" "$REVIEWERS_BY_PR_FILE"
 echo "creator,number,created_at,merged_at,hours,business_hours" > "$PR_TIMES_FILE"
 
 # Write the beginning of the JSON array
@@ -88,11 +97,7 @@ business_hours() {
     echo $business_hours
 }
 
-# Variable to count PRs processed for comments
-COMMENTS_PR_COUNT=0
-MAX_COMMENTS_PR=50  # Limit for total number of PRs for comments
-
-# Function to fetch and process PRs
+# First pass: get all PR numbers and basic stats
 fetch_prs() {
     local page=1
     
@@ -129,6 +134,9 @@ fetch_prs() {
         echo "$items" | jq -c '.[]' | while read -r item; do
             pr_number=$(echo "$item" | jq -r '.number')
             echo "Retrieving details for PR #$pr_number..."
+            
+            # Store PR number for later sampling
+            echo "$pr_number" >> "$ALL_PR_NUMBERS"
             
             # Step 2: Retrieve complete details for each PR
             pr_details=$(curl -s -H "Authorization: token $TOKEN" \
@@ -180,20 +188,6 @@ fetch_prs() {
                     # Add to CSV file
                     echo "$creator,$pr_number,$created_at,$merged_at,$hours,$business_hrs" >> "$PR_TIMES_FILE"
                 fi
-                
-                # Retrieve comments (limited to the defined total number of PRs)
-                if [ $COMMENTS_PR_COUNT -lt $MAX_COMMENTS_PR ]; then
-                    # Step 3: Retrieve review comments for statistics
-                    review_comments_url="https://api.github.com/repos/$REPO/pulls/$pr_number/comments"
-                    review_comments=$(curl -s -H "Authorization: token $TOKEN" \
-                                         -H "Accept: application/vnd.github.v3+json" \
-                                         "$review_comments_url")
-                    
-                    # Extract comment users
-                    echo "$review_comments" | jq -r '.[] | .user.login' 2>/dev/null | grep -v "^$" >> "$COMMENTERS_FILE"
-                    
-                    COMMENTS_PR_COUNT=$((COMMENTS_PR_COUNT + 1))
-                fi
             else
                 echo "Error retrieving details for PR #$pr_number"
             fi
@@ -213,6 +207,73 @@ fetch_prs() {
     done
 }
 
+# Second pass: collect comments and reviews from a representative sample or all PRs
+collect_comments_and_reviews() {
+    MAX_COMMENTS_PR=50  # Limit for total number of PRs for comments if sampling is enabled
+    
+    echo "Collecting detailed data for comments and reviews..."
+    
+    # Get total number of PRs
+    TOTAL_PRS=$(cat "$TOTAL_COUNT_FILE")
+    
+    if [ $TOTAL_PRS -eq 0 ]; then
+        echo "No PRs found, skipping detailed analysis."
+        return
+    fi
+    
+    # Determine which PRs to analyze
+    if [ "$DISABLE_SAMPLING" = "true" ]; then
+        # Analyze all PRs if sampling is disabled
+        SAMPLE_PRS=$(cat "$ALL_PR_NUMBERS")
+        echo "Sampling disabled: analyzing all $TOTAL_PRS PRs for comments and reviews"
+    else
+        # Select a representative sample if sampling is enabled
+        if [ $TOTAL_PRS -le $MAX_COMMENTS_PR ]; then
+            # If we have fewer PRs than our limit, analyze all of them
+            SAMPLE_PRS=$(cat "$ALL_PR_NUMBERS")
+            echo "Small dataset: analyzing all $TOTAL_PRS PRs for comments and reviews"
+        else
+            # Otherwise, take a random sample
+            SAMPLE_PRS=$(sort -R "$ALL_PR_NUMBERS" | head -$MAX_COMMENTS_PR)
+            echo "Sampling enabled: analyzing $MAX_COMMENTS_PR PRs out of $TOTAL_PRS for comments and reviews"
+        fi
+    fi
+    
+    # For each sampled PR, collect comments and reviews
+    for pr_number in $SAMPLE_PRS; do
+        echo "Collecting detailed data for PR #$pr_number..."
+        
+        # Collect comments
+        review_comments_url="https://api.github.com/repos/$REPO/pulls/$pr_number/comments"
+        review_comments=$(curl -s -H "Authorization: token $TOKEN" \
+                             -H "Accept: application/vnd.github.v3+json" \
+                             "$review_comments_url")
+        
+        # Extract comment users
+        echo "$review_comments" | jq -r '.[] | .user.login' 2>/dev/null | grep -v "^$" >> "$COMMENTERS_FILE"
+        
+        # Collect reviews
+        reviews_url="https://api.github.com/repos/$REPO/pulls/$pr_number/reviews"
+        reviews=$(curl -s -H "Authorization: token $TOKEN" \
+                    -H "Accept: application/vnd.github.v3+json" \
+                    "$reviews_url")
+        
+        # Extract unique reviewer logins for this PR
+        reviewers=$(echo "$reviews" | jq -r '.[] | .user.login' 2>/dev/null | grep -v "^$" | sort -u)
+        
+        if [ -n "$reviewers" ]; then
+            echo "$reviewers" | while read -r reviewer; do
+                echo "$pr_number $reviewer" >> "$REVIEWERS_BY_PR_FILE"
+            done
+        fi
+        
+        sleep 0.3  # Avoid API rate limits
+    done
+    
+    ANALYZED_COUNT=$(echo "$SAMPLE_PRS" | wc -l | tr -d ' ')
+    echo "Detailed analysis completed for $ANALYZED_COUNT PRs."
+}
+
 # Fetch PRs
 fetch_prs
 
@@ -228,6 +289,9 @@ if [ "$TOTAL_PRS" -eq 0 ]; then
     rm -rf "$TEMP_DIR"
     exit 0
 fi
+
+# Collect comments and reviews from a representative sample or all PRs
+collect_comments_and_reviews
 
 echo -e "\n============== PULL REQUEST STATISTICS ==============="
 
@@ -257,7 +321,13 @@ echo "  - Open: $OPEN"
 echo "  - Closed (without merge): $CLOSED_NOT_MERGED"
 
 # Commenter statistics
-echo -e "\n👥 Most active commenters (sample of the first $MAX_COMMENTS_PR PRs):"
+ANALYZED_COUNT=$(echo "$SAMPLE_PRS" | wc -l | tr -d ' ')
+if [ "$DISABLE_SAMPLING" = "true" ]; then
+    COMMENT_HEADER="👥 Most active commenters (all $ANALYZED_COUNT PRs):"
+else
+    COMMENT_HEADER="👥 Most active commenters (sample of $ANALYZED_COUNT PRs):"
+fi
+echo -e "\n$COMMENT_HEADER"
 if [ -s "$COMMENTERS_FILE" ]; then
     sort "$COMMENTERS_FILE" | uniq -c | sort -nr | head -10 |
     while read count user; do
@@ -265,6 +335,46 @@ if [ -s "$COMMENTERS_FILE" ]; then
     done
 else
     echo "  No comments found."
+fi
+
+# Calculate review coverage statistics
+echo -e "\n👀 PR Review Coverage Statistics:"
+if [ -s "$REVIEWERS_BY_PR_FILE" ]; then
+    # Get unique list of PRs that were analyzed for reviews
+    REVIEWED_PRS=$(cut -d' ' -f1 "$REVIEWERS_BY_PR_FILE" | sort -u)
+    REVIEWED_PR_COUNT=$(echo "$REVIEWED_PRS" | wc -l)
+    
+    if [ "$DISABLE_SAMPLING" = "true" ]; then
+        echo "  All $REVIEWED_PR_COUNT PRs analyzed for review coverage"
+    else
+        echo "  Sample of $REVIEWED_PR_COUNT PRs analyzed for review coverage"
+    fi
+    
+    # Calculate percentage of PRs reviewed by each person
+    echo -e "\n  Review coverage by user (percentage of PRs reviewed):"
+    
+    # Count unique PRs reviewed by each person
+    cut -d' ' -f2 "$REVIEWERS_BY_PR_FILE" | sort -u | 
+    while read -r reviewer; do
+        # Count how many unique PRs this person reviewed
+        prs_reviewed=$(grep " $reviewer$" "$REVIEWERS_BY_PR_FILE" | cut -d' ' -f1 | sort -u | wc -l | tr -d ' ')
+        
+        # Calculate percentage
+        percentage=$(echo "scale=1; ($prs_reviewed * 100) / $REVIEWED_PR_COUNT" | bc)
+        
+        # Add to temporary file for sorting
+        echo "$reviewer $prs_reviewed $percentage" >> "${TEMP_DIR}/reviewer_percentages.txt"
+    done
+    
+    # Display sorted by percentage (highest first)
+    if [ -s "${TEMP_DIR}/reviewer_percentages.txt" ]; then
+        sort -k3,3nr -k2,2nr "${TEMP_DIR}/reviewer_percentages.txt" | 
+        while read -r reviewer count percentage; do
+            echo "  - $reviewer: $count/$REVIEWED_PR_COUNT PRs ($percentage%)"
+        done
+    fi
+else
+    echo "  No review data found."
 fi
 
 # Average time by creator (for merged PRs) - excluding weekends
