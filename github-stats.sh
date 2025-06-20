@@ -1,29 +1,41 @@
 #!/bin/bash
 
-# GitHub Pull Request Analysis Script with customizable label
-# Usage: ./github_pr_stats.sh <owner/repo> <label> <github_token> [max_pages] [disable_sampling]
+# GitHub Pull Request Analysis Script with customizable label and multiple repositories
+# Usage: ./github_pr_stats.sh <repo1,repo2,repo3> <label> <github_token> [max_pages] [disable_sampling]
 
 # Check for required parameters
 if [ $# -lt 3 ]; then
-    echo "Usage: $0 <owner/repo> <label> <github_token> [max_pages] [disable_sampling]"
-    echo "Example: $0 my-orga/main-app YOURLABEL YOUR_GITHUB_TOKEN 10 true"
-    echo "Error: Label and GitHub token are required."
+    echo "Usage: $0 <repositories> <label> <github_token> [max_pages] [disable_sampling]"
+    echo "Example: $0 myorga/main-app,myorga/runtime YOURLABEL YOUR_GITHUB_TOKEN 10 true"
+    echo "Error: Repositories and GitHub token are required."
     echo "Optional: max_pages (default: 10), disable_sampling (true/false, default: false)"
+    echo "Note: Repositories should be comma-separated (no spaces)"
     exit 1
 fi
 
-REPO=$1
+REPOSITORIES=$1
 LABEL=$2
 TOKEN=$3
 MAX_PAGES=${4:-10}
 DISABLE_SAMPLING=${5:-false}
 
-echo "Analyzing PRs with label '$LABEL' for repository $REPO (max $MAX_PAGES pages)"
+# Parse repositories into an array
+IFS=',' read -ra REPO_ARRAY <<< "$REPOSITORIES"
+
+# Get the directory where the script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMENTS_OUTPUT_DIR="${SCRIPT_DIR}/comments_output"
+
+echo "Analyzing PRs with label '$LABEL' for repositories: ${REPO_ARRAY[*]} (max $MAX_PAGES pages each)"
 if [ "$DISABLE_SAMPLING" = "true" ]; then
     echo "Sampling disabled: all PRs will be analyzed for comments and reviews"
 else
     echo "Sampling enabled: a representative sample will be used for comments and reviews"
 fi
+echo "Comments will be saved to: $COMMENTS_OUTPUT_DIR"
+
+# Create comments output directory if it doesn't exist
+mkdir -p "$COMMENTS_OUTPUT_DIR"
 
 # Calculate date from 3 months ago in ISO 8601 format
 THREE_MONTHS_AGO=$(date -v-3m +%Y-%m-%dT%H:%M:%SZ)
@@ -40,11 +52,12 @@ MERGED_FILE="${TEMP_DIR}/merged.txt"      # Specific file for merged PRs
 COMMENTERS_FILE="${TEMP_DIR}/commenters.txt"
 REVIEWERS_BY_PR_FILE="${TEMP_DIR}/reviewers_by_pr.txt"  # For PR review coverage
 PR_TIMES_FILE="${TEMP_DIR}/pr_times.csv"
+REPO_STATS_FILE="${TEMP_DIR}/repo_stats.txt"  # Track stats per repository
 
 # Initialize files
 echo "0" > "$TOTAL_COUNT_FILE"
-touch "$PR_FILE" "$ALL_PR_NUMBERS" "$CREATORS_FILE" "$STATES_FILE" "$MERGED_FILE" "$COMMENTERS_FILE" "$REVIEWERS_BY_PR_FILE"
-echo "creator,number,created_at,merged_at,hours,business_hours" > "$PR_TIMES_FILE"
+touch "$PR_FILE" "$ALL_PR_NUMBERS" "$CREATORS_FILE" "$STATES_FILE" "$MERGED_FILE" "$COMMENTERS_FILE" "$REVIEWERS_BY_PR_FILE" "$REPO_STATS_FILE"
+echo "creator,number,created_at,merged_at,hours,business_hours,repository" > "$PR_TIMES_FILE"
 
 # Write the beginning of the JSON array
 echo "[" > "$PR_FILE"
@@ -97,15 +110,61 @@ business_hours() {
     echo $business_hours
 }
 
-# First pass: get all PR numbers and basic stats
-fetch_prs() {
-    local page=1
+# Function to save comment to user's file
+save_comment_to_file() {
+    local user=$1
+    local pr_number=$2
+    local comment_body=$3
+    local comment_date=$4
+    local comment_url=$5
+    local repository=$6
     
+    # Sanitize username for filename (replace special characters with underscores)
+    local safe_username=$(echo "$user" | sed 's/[^a-zA-Z0-9._-]/_/g')
+    local user_file="${COMMENTS_OUTPUT_DIR}/${safe_username}_comments.md"
+    
+    # Create user file with header if it doesn't exist
+    if [ ! -f "$user_file" ]; then
+        cat > "$user_file" << EOF
+# Comments by $user
+
+Repositories: ${REPO_ARRAY[*]}
+Label: $LABEL
+Generated on: $(date)
+
+---
+
+EOF
+    fi
+    
+    # Append comment to user's file
+    cat >> "$user_file" << EOF
+## $repository - PR #$pr_number - $(echo "$comment_date" | cut -d'T' -f1)
+
+**Repository:** $repository
+**Date:** $comment_date
+**URL:** $comment_url
+
+$comment_body
+
+---
+
+EOF
+}
+
+# Function to fetch PRs for a single repository
+fetch_prs_for_repo() {
+    local repo=$1
+    local repo_pr_count=0
+    
+    echo "Processing repository: $repo"
+    
+    local page=1
     while [ $page -le $MAX_PAGES ]; do
-        echo "Retrieving page $page..."
+        echo "  Retrieving page $page for $repo..."
         
         # Build the search query
-        QUERY="repo:$REPO is:pr label:$LABEL created:>=$THREE_MONTHS_AGO"
+        QUERY="repo:$repo is:pr label:$LABEL created:>=$THREE_MONTHS_AGO"
         ENCODED_QUERY=$(echo "$QUERY" | sed 's/ /%20/g')
         
         # Step 1: Search for PRs with the specified label (GitHub treats PRs as a type of issue)
@@ -115,36 +174,39 @@ fetch_prs() {
         
         # Check if the response contains an error
         if echo "$response" | jq -e 'has("message")' > /dev/null; then
-            echo "API Error: $(echo "$response" | jq -r '.message')"
+            echo "  API Error for $repo: $(echo "$response" | jq -r '.message')"
             break
         fi
         
         # Extract PR numbers
         items=$(echo "$response" | jq '.items')
         item_count=$(echo "$items" | jq 'length')
-        echo "Found $item_count PRs on page $page"
+        echo "  Found $item_count PRs on page $page for $repo"
         
-        # If no items, stop pagination
+        # If no items, stop pagination for this repo
         if [ "$item_count" -eq 0 ]; then
-            echo "Empty page, ending pagination."
+            echo "  Empty page for $repo, ending pagination."
             break
         fi
         
         # For each PR, retrieve the details and add to the file
         echo "$items" | jq -c '.[]' | while read -r item; do
             pr_number=$(echo "$item" | jq -r '.number')
-            echo "Retrieving details for PR #$pr_number..."
+            echo "  Retrieving details for $repo PR #$pr_number..."
             
-            # Store PR number for later sampling
-            echo "$pr_number" >> "$ALL_PR_NUMBERS"
+            # Store PR number with repository for later sampling
+            echo "$repo:$pr_number" >> "$ALL_PR_NUMBERS"
             
             # Step 2: Retrieve complete details for each PR
             pr_details=$(curl -s -H "Authorization: token $TOKEN" \
                              -H "Accept: application/vnd.github.v3+json" \
-                             "https://api.github.com/repos/$REPO/pulls/$pr_number")
+                             "https://api.github.com/repos/$repo/pulls/$pr_number")
             
             # Check if the response is valid
             if echo "$pr_details" | jq -e 'has("url")' > /dev/null; then
+                # Add repository information to the PR details
+                pr_details_with_repo=$(echo "$pr_details" | jq --arg repo "$repo" '. + {repository: $repo}')
+                
                 # Add the PR to the JSON file, handling comma for valid JSON format
                 if [ "$first_pr" = true ]; then
                     first_pr=false
@@ -153,20 +215,23 @@ fetch_prs() {
                 fi
                 
                 # Write the complete PR to the file
-                echo "$pr_details" >> "$PR_FILE"
+                echo "$pr_details_with_repo" >> "$PR_FILE"
                 
                 # Increment the total PR counter
                 current_count=$(cat "$TOTAL_COUNT_FILE")
                 current_count=$((current_count + 1))
                 echo "$current_count" > "$TOTAL_COUNT_FILE"
                 
+                # Increment repo-specific counter
+                repo_pr_count=$((repo_pr_count + 1))
+                
                 # Extract and store important information directly
                 creator=$(echo "$pr_details" | jq -r '.user.login')
                 state=$(echo "$pr_details" | jq -r '.state')
                 is_merged=$(echo "$pr_details" | jq -r '.merged')
                 
-                # Store in separate files for reliable counting
-                echo "$creator" >> "$CREATORS_FILE"
+                # Store in separate files for reliable counting (with repo prefix for creators)
+                echo "$repo:$creator" >> "$CREATORS_FILE"
                 echo "$state" >> "$STATES_FILE"
                 if [ "$is_merged" = "true" ]; then
                     echo "true" >> "$MERGED_FILE"
@@ -185,25 +250,36 @@ fetch_prs() {
                     # Calculate business hours (exclude weekends)
                     business_hrs=$(business_hours "$created_at" "$merged_at")
                     
-                    # Add to CSV file
-                    echo "$creator,$pr_number,$created_at,$merged_at,$hours,$business_hrs" >> "$PR_TIMES_FILE"
+                    # Add to CSV file with repository information
+                    echo "$creator,$pr_number,$created_at,$merged_at,$hours,$business_hrs,$repo" >> "$PR_TIMES_FILE"
                 fi
             else
-                echo "Error retrieving details for PR #$pr_number"
+                echo "  Error retrieving details for $repo PR #$pr_number"
             fi
             
             # Increase delay between requests
             sleep 0.3
         done
         
-        # If less than 100 items, it's the last page
+        # If less than 100 items, it's the last page for this repo
         if [ "$item_count" -lt 100 ]; then
-            echo "Less than 100 results, ending pagination."
+            echo "  Less than 100 results for $repo, ending pagination."
             break
         fi
         
         page=$((page + 1))
         sleep 0.5
+    done
+    
+    # Record stats for this repository
+    echo "$repo:$repo_pr_count" >> "$REPO_STATS_FILE"
+    echo "Completed processing $repo: $repo_pr_count PRs found"
+}
+
+# First pass: get all PR numbers and basic stats for all repositories
+fetch_prs() {
+    for repo in "${REPO_ARRAY[@]}"; do
+        fetch_prs_for_repo "$repo"
     done
 }
 
@@ -233,6 +309,7 @@ collect_comments_and_reviews() {
             SAMPLE_PRS=$(cat "$ALL_PR_NUMBERS")
             echo "Small dataset: analyzing all $TOTAL_PRS PRs for comments and reviews"
         else
+            # Otherwiseelse
             # Otherwise, take a random sample
             SAMPLE_PRS=$(sort -R "$ALL_PR_NUMBERS" | head -$MAX_COMMENTS_PR)
             echo "Sampling enabled: analyzing $MAX_COMMENTS_PR PRs out of $TOTAL_PRS for comments and reviews"
@@ -240,41 +317,78 @@ collect_comments_and_reviews() {
     fi
     
     # For each sampled PR, collect comments and reviews
-    for pr_number in $SAMPLE_PRS; do
-        echo "Collecting detailed data for PR #$pr_number..."
+    for repo_pr in $SAMPLE_PRS; do
+        # Split repo:pr_number
+        repo=$(echo "$repo_pr" | cut -d':' -f1)
+        pr_number=$(echo "$repo_pr" | cut -d':' -f2)
         
-        # Collect comments
-        review_comments_url="https://api.github.com/repos/$REPO/pulls/$pr_number/comments"
+        echo "Collecting detailed data for $repo PR #$pr_number..."
+        
+        # Collect review comments (inline code comments)
+        review_comments_url="https://api.github.com/repos/$repo/pulls/$pr_number/comments"
         review_comments=$(curl -s -H "Authorization: token $TOKEN" \
                              -H "Accept: application/vnd.github.v3+json" \
                              "$review_comments_url")
         
-        # Extract comment users
-        echo "$review_comments" | jq -r '.[] | .user.login' 2>/dev/null | grep -v "^$" >> "$COMMENTERS_FILE"
+        # Process review comments and save to individual files
+        echo "$review_comments" | jq -c '.[]' 2>/dev/null | while read -r comment; do
+            if [ -n "$comment" ] && [ "$comment" != "null" ]; then
+                user=$(echo "$comment" | jq -r '.user.login')
+                body=$(echo "$comment" | jq -r '.body')
+                created_at=$(echo "$comment" | jq -r '.created_at')
+                html_url=$(echo "$comment" | jq -r '.html_url')
+                
+                if [ "$user" != "null" ] && [ "$body" != "null" ]; then
+                    # Add to commenters file for statistics
+                    echo "$user" >> "$COMMENTERS_FILE"
+                    
+                    # Save comment to user's individual file
+                    save_comment_to_file "$user" "$pr_number" "$body" "$created_at" "$html_url" "$repo"
+                fi
+            fi
+        done
         
-        # Collect reviews
-        reviews_url="https://api.github.com/repos/$REPO/pulls/$pr_number/reviews"
+        # Collect general PR reviews (approve/request changes/comment)
+        reviews_url="https://api.github.com/repos/$repo/pulls/$pr_number/reviews"
         reviews=$(curl -s -H "Authorization: token $TOKEN" \
                     -H "Accept: application/vnd.github.v3+json" \
                     "$reviews_url")
         
-        # Extract unique reviewer logins for this PR
-        reviewers=$(echo "$reviews" | jq -r '.[] | .user.login' 2>/dev/null | grep -v "^$" | sort -u)
-        
-        if [ -n "$reviewers" ]; then
-            echo "$reviewers" | while read -r reviewer; do
-                echo "$pr_number $reviewer" >> "$REVIEWERS_BY_PR_FILE"
-            done
-        fi
+        # Process reviews and save to individual files
+        echo "$reviews" | jq -c '.[]' 2>/dev/null | while read -r review; do
+            if [ -n "$review" ] && [ "$review" != "null" ]; then
+                user=$(echo "$review" | jq -r '.user.login')
+                body=$(echo "$review" | jq -r '.body')
+                state=$(echo "$review" | jq -r '.state')
+                created_at=$(echo "$review" | jq -r '.submitted_at')
+                html_url=$(echo "$review" | jq -r '.html_url')
+                
+                if [ "$user" != "null" ]; then
+                    # Add to reviewers file for statistics (unique reviewers per PR)
+                    echo "$repo:$pr_number $user" >> "$REVIEWERS_BY_PR_FILE"
+                    
+                    # Save review to user's individual file if there's a body or it's not just a comment
+                    if [ "$body" != "null" ] && [ "$body" != "" ]; then
+                        review_content="**Review State:** $state\n\n$body"
+                        save_comment_to_file "$user" "$pr_number" "$review_content" "$created_at" "$html_url" "$repo"
+                    elif [ "$state" != "COMMENTED" ]; then
+                        # Save approve/request changes even without body
+                        review_content="**Review State:** $state"
+                        save_comment_to_file "$user" "$pr_number" "$review_content" "$created_at" "$html_url" "$repo"
+                    fi
+                fi
+            fi
+        done
         
         sleep 0.3  # Avoid API rate limits
     done
     
     ANALYZED_COUNT=$(echo "$SAMPLE_PRS" | wc -l | tr -d ' ')
     echo "Detailed analysis completed for $ANALYZED_COUNT PRs."
+    echo "Comments saved to individual files in: $COMMENTS_OUTPUT_DIR"
 }
 
-# Fetch PRs
+# Fetch PRs for all repositories
 fetch_prs
 
 # Close the JSON array
@@ -285,7 +399,7 @@ TOTAL_PRS=$(cat "$TOTAL_COUNT_FILE")
 
 # Explicitly check if PRs were found
 if [ "$TOTAL_PRS" -eq 0 ]; then
-    echo "No PRs with label '$LABEL' found in the last 3 months."
+    echo "No PRs with label '$LABEL' found in the last 3 months across all repositories."
     rm -rf "$TEMP_DIR"
     exit 0
 fi
@@ -295,18 +409,25 @@ collect_comments_and_reviews
 
 echo -e "\n============== PULL REQUEST STATISTICS ==============="
 
-# Total number of PRs
+# Total number of PRs across all repositories
 echo -e "\n📊 Total number of PRs with label '$LABEL': $TOTAL_PRS"
 
-# Statistics by PR creator - use the dedicated file
-echo -e "\n🧑‍💻 PRs created by user:"
+# Statistics by repository
+echo -e "\n📁 PRs by repository:"
+if [ -s "$REPO_STATS_FILE" ]; then
+    while IFS=':' read -r repo count; do
+        echo "  - $repo: $count PRs"
+    done < "$REPO_STATS_FILE"
+fi
+
+# Statistics by PR creator - use the dedicated file (remove repo prefix for display)
+echo -e "\n🧑‍💻 PRs created by user (across all repositories):"
 if [ -s "$CREATORS_FILE" ]; then
-    sort "$CREATORS_FILE" | uniq -c | sort -nr | 
+    # Remove repo prefix and count
+    cut -d':' -f2 "$CREATORS_FILE" | sort | uniq -c | sort -nr | 
     while read count user; do
         echo "  - $user: $count PRs"
     done
-else
-    echo "  No creator information available."
 fi
 
 # PR status statistics - use dedicated files
@@ -323,9 +444,9 @@ echo "  - Closed (without merge): $CLOSED_NOT_MERGED"
 # Commenter statistics
 ANALYZED_COUNT=$(echo "$SAMPLE_PRS" | wc -l | tr -d ' ')
 if [ "$DISABLE_SAMPLING" = "true" ]; then
-    COMMENT_HEADER="👥 Most active commenters (all $ANALYZED_COUNT PRs):"
+    COMMENT_HEADER="👥 Most active commenters (all $ANALYZED_COUNT PRs across all repositories):"
 else
-    COMMENT_HEADER="👥 Most active commenters (sample of $ANALYZED_COUNT PRs):"
+    COMMENT_HEADER="👥 Most active commenters (sample of $ANALYZED_COUNT PRs across all repositories):"
 fi
 echo -e "\n$COMMENT_HEADER"
 if [ -s "$COMMENTERS_FILE" ]; then
@@ -340,7 +461,7 @@ fi
 # Calculate review coverage statistics
 echo -e "\n👀 PR Review Coverage Statistics:"
 if [ -s "$REVIEWERS_BY_PR_FILE" ]; then
-    # Get unique list of PRs that were analyzed for reviews
+    # Get unique list of PRs that were analyzed for reviews (remove repo prefix)
     REVIEWED_PRS=$(cut -d' ' -f1 "$REVIEWERS_BY_PR_FILE" | sort -u)
     REVIEWED_PR_COUNT=$(echo "$REVIEWED_PRS" | wc -l)
     
@@ -378,7 +499,7 @@ else
 fi
 
 # Average time by creator (for merged PRs) - excluding weekends
-echo -e "\n⏱️ Average resolution time by creator (excluding weekends):"
+echo -e "\n⏱️ Average resolution time by creator (excluding weekends, across all repositories):"
 if [ -s "$PR_TIMES_FILE" ] && [ $(wc -l < "$PR_TIMES_FILE") -gt 1 ]; then
     # Use awk to calculate average by creator
     tail -n +2 "$PR_TIMES_FILE" | awk -F ',' '
@@ -458,6 +579,22 @@ if [ -s "$PR_TIMES_FILE" ] && [ $(wc -l < "$PR_TIMES_FILE") -gt 1 ]; then
     }'
 else
     echo "  No merged PRs found."
+fi
+
+# Display summary of saved comments
+echo -e "\n📝 Comments Export Summary:"
+if [ -d "$COMMENTS_OUTPUT_DIR" ] && [ "$(ls -A "$COMMENTS_OUTPUT_DIR" 2>/dev/null)" ]; then
+    comment_files=$(ls "$COMMENTS_OUTPUT_DIR"/*_comments.md 2>/dev/null | wc -l | tr -d ' ')
+    echo "  Comments saved for $comment_files users in: $COMMENTS_OUTPUT_DIR"
+    echo "  Files created:"
+    ls "$COMMENTS_OUTPUT_DIR"/*_comments.md 2>/dev/null | while read -r file; do
+        filename=$(basename "$file")
+        username=$(echo "$filename" | sed 's/_comments\.md$//')
+        comment_count=$(grep -c "^## " "$file" 2>/dev/null || echo 0)
+        echo "    - $filename ($comment_count comments)"
+    done
+else
+    echo "  No comment files were created."
 fi
 
 # Cleanup
